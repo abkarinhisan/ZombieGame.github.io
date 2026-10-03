@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outpost 9 – Zombie Defense (Phase 1)</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0d0c;overflow:hidden}
+  canvas{display:block;cursor:crosshair}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ===== js/utils.js =====
+// Small shared helpers + world constants.
+const WORLD = { w: 2400, h: 1600 };
+
+const Utils = {
+  clamp: (v, lo, hi) => Math.max(lo, Math.min(hi, v)),
+  dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y),
+  rand: (lo, hi) => lo + Math.random() * (hi - lo),
+
+  // Push a circle entity (x, y, radius) out of an axis-aligned rectangle.
+  pushOutOfRect(e, r) {
+    const cx = Utils.clamp(e.x, r.x, r.x + r.w);
+    const cy = Utils.clamp(e.y, r.y, r.y + r.h);
+    let dx = e.x - cx, dy = e.y - cy, d = Math.hypot(dx, dy);
+    if (d >= e.radius) return;
+    if (d === 0) { dx = 1; dy = 0; d = 1; }
+    const push = e.radius - d;
+    e.x += (dx / d) * push;
+    e.y += (dy / d) * push;
+  },
+  pointInRect: (x, y, r) => x > r.x && x < r.x + r.w && y > r.y && y < r.y + r.h,
+};
+
+// ===== js/input.js =====
+// Keyboard + mouse state. "pressed" values last one frame (call Input.endFrame()).
+const Input = {
+  keys: {}, pressed: {}, mouse: { x: 0, y: 0, down: false },
+
+  init(canvas) {
+    window.addEventListener('keydown', e => {
+      if (!this.keys[e.code]) this.pressed[e.code] = true;
+      this.keys[e.code] = true;
+    });
+    window.addEventListener('keyup', e => { this.keys[e.code] = false; });
+    window.addEventListener('blur', () => { this.keys = {}; this.mouse.down = false; });
+    canvas.addEventListener('mousemove', e => { this.mouse.x = e.offsetX; this.mouse.y = e.offsetY; });
+    canvas.addEventListener('mousedown', e => { if (e.button === 0) this.mouse.down = true; });
+    window.addEventListener('mouseup', e => { if (e.button === 0) this.mouse.down = false; });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+  },
+  isDown: code => !!Input.keys[code],
+  wasPressed: code => !!Input.pressed[code],
+  endFrame() { this.pressed = {}; },
+};
+
+// ===== js/weaponSystem.js =====
+// Weapon data + per-weapon state (ammo, cooldown, reload). Phase 5 adds rifle/shotgun here.
+const WEAPONS = {
+  pistol: {
+    name: 'Pistol', damage: 25, fireRate: 3.5, // shots per second
+    magSize: 12, reloadTime: 1.2, range: 600, bulletSpeed: 900, pellets: 1, spread: 0.02,
+  },
+};
+
+class WeaponSystem {
+  constructor(id) {
+    this.def = WEAPONS[id];
+    this.ammo = this.def.magSize;
+    this.cooldown = 0;
+    this.reloadLeft = 0;
+  }
+  get isReloading() { return this.reloadLeft > 0; }
+
+  update(dt) {
+    this.cooldown = Math.max(0, this.cooldown - dt);
+    if (this.isReloading) {
+      this.reloadLeft -= dt;
+      if (this.reloadLeft <= 0) { this.reloadLeft = 0; this.ammo = this.def.magSize; }
+    }
+  }
+
+  startReload() {
+    // Edge cases: already full, or already reloading -> ignore.
+    if (this.isReloading || this.ammo >= this.def.magSize) return;
+    this.reloadLeft = this.def.reloadTime;
+  }
+
+  // Returns an array of new bullets (empty if the weapon could not fire).
+  tryShoot(x, y, angle) {
+    if (this.isReloading || this.cooldown > 0) return [];
+    if (this.ammo <= 0) { this.startReload(); return []; } // dry fire -> auto reload
+    this.ammo--;
+    this.cooldown = 1 / this.def.fireRate;
+    const bullets = [];
+    for (let i = 0; i < this.def.pellets; i++) {
+      const a = angle + Utils.rand(-this.def.spread, this.def.spread);
+      bullets.push({
+        x, y, vx: Math.cos(a) * this.def.bulletSpeed, vy: Math.sin(a) * this.def.bulletSpeed,
+        damage: this.def.damage, range: this.def.range, travelled: 0, dead: false,
+      });
+    }
+    if (this.ammo === 0) this.startReload();
+    return bullets;
+  }
+}
+
+// ===== js/playerController.js =====
+// Player: movement, aiming, health, shooting via WeaponSystem.
+class PlayerController {
+  constructor(x, y) {
+    this.x = x; this.y = y; this.radius = 16;
+    this.speed = 190; this.sprintMult = 1.6;
+    this.maxHealth = 100; this.health = 100;
+    this.angle = 0;
+    this.weapon = new WeaponSystem('pistol');
+    this.hurtFlash = 0;
+  }
+  get dead() { return this.health <= 0; }
+
+  update(dt, mouseWorld, obstacles, bullets) {
+    // Movement (normalised so diagonals aren't faster)
+    let dx = (Input.isDown('KeyD') ? 1 : 0) - (Input.isDown('KeyA') ? 1 : 0);
+    let dy = (Input.isDown('KeyS') ? 1 : 0) - (Input.isDown('KeyW') ? 1 : 0);
+    const len = Math.hypot(dx, dy);
+    if (len > 0) {
+      const spd = this.speed * (Input.isDown('ShiftLeft') || Input.isDown('ShiftRight') ? this.sprintMult : 1);
+      this.x += (dx / len) * spd * dt;
+      this.y += (dy / len) * spd * dt;
+    }
+    this.x = Utils.clamp(this.x, this.radius, WORLD.w - this.radius);
+    this.y = Utils.clamp(this.y, this.radius, WORLD.h - this.radius);
+    obstacles.forEach(o => Utils.pushOutOfRect(this, o));
+
+    // Aim at mouse
+    this.angle = Math.atan2(mouseWorld.y - this.y, mouseWorld.x - this.x);
+
+    // Weapon
+    this.weapon.update(dt);
+    if (Input.wasPressed('KeyR')) this.weapon.startReload();
+    if (Input.mouse.down) {
+      const muzzle = this.radius + 14;
+      bullets.push(...this.weapon.tryShoot(
+        this.x + Math.cos(this.angle) * muzzle, this.y + Math.sin(this.angle) * muzzle, this.angle));
+    }
+    this.hurtFlash = Math.max(0, this.hurtFlash - dt);
+  }
+
+  takeDamage(amount) {
+    if (this.dead) return;
+    this.health = Math.max(0, this.health - amount);
+    this.hurtFlash = 0.25;
+  }
+
+  draw(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.beginPath(); ctx.ellipse(3, 5, this.radius, this.radius * .8, 0, 0, 7); ctx.fill();
+    ctx.rotate(this.angle);
+    ctx.fillStyle = '#2f3a2c'; ctx.fillRect(4, -4, 26, 8);           // gun
+    ctx.fillStyle = this.hurtFlash > 0 ? '#e25b4a' : '#5d7a4f';       // body
+    ctx.beginPath(); ctx.arc(0, 0, this.radius, 0, 7); ctx.fill();
+    ctx.fillStyle = '#d2b48c'; ctx.beginPath(); ctx.arc(2, 0, 7, 0, 7); ctx.fill(); // head
+    ctx.restore();
+  }
+}
+
+// ===== js/zombieController.js =====
+// Zombie: chase target, attack when close, take damage, die. Phase 4 adds more types.
+const ZOMBIE_TYPES = {
+  normal: { health: 60, speed: 60, damage: 10, attackRate: 1.0, radius: 15, color: '#6f8f4a', reward: 10 },
+};
+
+class ZombieController {
+  constructor(type, x, y) {
+    this.def = ZOMBIE_TYPES[type];
+    this.x = x; this.y = y; this.radius = this.def.radius;
+    this.health = this.def.health; this.maxHealth = this.def.health;
+    this.attackCooldown = 0; this.hitFlash = 0; this.angle = 0;
+    this.dead = false;
+  }
+
+  update(dt, target, obstacles) {
+    this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+    this.hitFlash = Math.max(0, this.hitFlash - dt);
+    const dx = target.x - this.x, dy = target.y - this.y, d = Math.hypot(dx, dy);
+    this.angle = Math.atan2(dy, dx);
+    const reach = this.radius + target.radius + 4;
+
+    if (d > reach) {                       // chase
+      this.x += (dx / d) * this.def.speed * dt;
+      this.y += (dy / d) * this.def.speed * dt;
+      obstacles.forEach(o => Utils.pushOutOfRect(this, o)); // slide around obstacles
+    } else if (this.attackCooldown <= 0) { // stop and attack
+      target.takeDamage(this.def.damage);
+      this.attackCooldown = 1 / this.def.attackRate;
+    }
+  }
+
+  takeDamage(amount) {
+    if (this.dead) return false;
+    this.health -= amount; this.hitFlash = 0.1;
+    if (this.health <= 0) this.dead = true;
+    return this.dead;
+  }
+
+  draw(ctx) {
+    ctx.save(); ctx.translate(this.x, this.y);
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.beginPath(); ctx.ellipse(3, 5, this.radius, this.radius * .8, 0, 0, 7); ctx.fill();
+    ctx.rotate(this.angle);
+    ctx.fillStyle = this.hitFlash > 0 ? '#fff' : this.def.color;
+    ctx.fillRect(6, -12, 14, 6); ctx.fillRect(6, 6, 14, 6);            // reaching arms
+    ctx.beginPath(); ctx.arc(0, 0, this.radius, 0, 7); ctx.fill();
+    ctx.fillStyle = '#a32020'; ctx.fillRect(7, -5, 3, 3); ctx.fillRect(7, 2, 3, 3); // eyes
+    ctx.restore();
+    if (this.health < this.maxHealth) {                                  // health bar
+      ctx.fillStyle = '#000a'; ctx.fillRect(this.x - 16, this.y - this.radius - 12, 32, 5);
+      ctx.fillStyle = '#c0392b'; ctx.fillRect(this.x - 16, this.y - this.radius - 12, 32 * this.health / this.maxHealth, 5);
+    }
+  }
+}
+
+// ===== js/uiManager.js =====
+// HUD + overlay screens (canvas-drawn for now; Phase 7 builds full menus).
+const UIManager = {
+  drawHUD(ctx, game) {
+    const p = game.player, w = p.weapon;
+    ctx.font = '600 18px "Trebuchet MS", sans-serif'; ctx.textBaseline = 'top';
+    ctx.fillStyle = '#000a'; ctx.fillRect(14, 14, 250, 118);
+    ctx.fillStyle = '#e8e4d8';
+    ctx.fillText('❤️ Health', 26, 24);
+    ctx.fillStyle = '#3a1512'; ctx.fillRect(130, 28, 120, 12);
+    ctx.fillStyle = '#d9483b'; ctx.fillRect(130, 28, 120 * p.health / p.maxHealth, 12);
+    ctx.fillStyle = '#e8e4d8';
+    ctx.fillText('🔫 ' + w.def.name, 26, 54);
+    ctx.fillText('🔢 ' + (w.isReloading ? 'Reloading…' : `${w.ammo} / ${w.def.magSize}`), 26, 82);
+    ctx.fillText('🧟 Zombies: ' + game.zombies.length, 26, 106);
+  },
+  drawGameOver(ctx, W, H) {
+    ctx.fillStyle = '#000b'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#d9483b'; ctx.font = '700 64px Georgia, serif'; ctx.textAlign = 'center';
+    ctx.fillText('YOU WERE OVERRUN', W / 2, H / 2 - 50);
+    ctx.fillStyle = '#e8e4d8'; ctx.font = '22px "Trebuchet MS", sans-serif';
+    ctx.fillText('Press Enter to restart', W / 2, H / 2 + 30);
+    ctx.textAlign = 'left';
+  },
+};
+
+// ===== js/gameManager.js =====
+// GameManager: owns the loop, world, camera, bullets, zombies and rendering.
+class GameManager {
+  constructor(canvas) {
+    this.canvas = canvas; this.ctx = canvas.getContext('2d');
+    this.resize(); window.addEventListener('resize', () => this.resize());
+    Input.init(canvas);
+    this.buildWorld();
+    this.reset();
+    this.last = performance.now();
+    requestAnimationFrame(t => this.loop(t));
+  }
+  resize() { this.canvas.width = innerWidth; this.canvas.height = innerHeight; }
+
+  // Static scenery. All are solid rectangles that block player, zombies and bullets.
+  buildWorld() {
+    this.obstacles = [
+      { x: 1050, y: 700, w: 300, h: 24, type: 'sandbag' }, { x: 1050, y: 900, w: 300, h: 24, type: 'sandbag' },
+      { x: 1050, y: 724, w: 24, h: 60, type: 'sandbag' },   { x: 1050, y: 840, w: 24, h: 60, type: 'sandbag' },
+      { x: 1326, y: 724, w: 24, h: 60, type: 'sandbag' },   { x: 1326, y: 840, w: 24, h: 60, type: 'sandbag' },
+      { x: 700, y: 500, w: 50, h: 50, type: 'crate' },  { x: 760, y: 520, w: 40, h: 40, type: 'crate' },
+      { x: 1600, y: 1100, w: 50, h: 50, type: 'crate' }, { x: 500, y: 1150, w: 220, h: 90, type: 'car' },
+      { x: 1700, y: 400, w: 180, h: 120, type: 'building' },
+    ];
+  }
+
+  reset() {
+    this.player = new PlayerController(WORLD.w / 2, WORLD.h / 2);
+    this.zombies = []; this.bullets = []; this.respawnTimer = 1;
+    this.state = 'playing'; this.cam = { x: 0, y: 0 };
+  }
+
+  // Phase 1 test spawner: one zombie at a time, just off-screen. Phase 2 replaces this with waves.
+  spawnZombie() {
+    const a = Math.random() * Math.PI * 2, r = Math.hypot(this.canvas.width, this.canvas.height) / 2 + 80;
+    this.zombies.push(new ZombieController('normal',
+      Utils.clamp(this.player.x + Math.cos(a) * r, 20, WORLD.w - 20),
+      Utils.clamp(this.player.y + Math.sin(a) * r, 20, WORLD.h - 20)));
+  }
+
+  loop(now) {
+    const dt = Math.min(0.05, (now - this.last) / 1000); this.last = now;
+    this.update(dt); this.draw(); Input.endFrame();
+    requestAnimationFrame(t => this.loop(t));
+  }
+
+  update(dt) {
+    if (this.state === 'gameover') { if (Input.wasPressed('Enter')) this.reset(); return; }
+    const W = this.canvas.width, H = this.canvas.height, p = this.player;
+    this.cam.x = Utils.clamp(p.x - W / 2, 0, Math.max(0, WORLD.w - W));
+    this.cam.y = Utils.clamp(p.y - H / 2, 0, Math.max(0, WORLD.h - H));
+    const mouseWorld = { x: Input.mouse.x + this.cam.x, y: Input.mouse.y + this.cam.y };
+
+    p.update(dt, mouseWorld, this.obstacles, this.bullets);
+
+    if (this.zombies.length === 0 && (this.respawnTimer -= dt) <= 0) { this.spawnZombie(); this.respawnTimer = 2; }
+    this.zombies.forEach(z => z.update(dt, p, this.obstacles));
+
+    // Bullets: move, hit walls, hit zombies
+    for (const b of this.bullets) {
+      b.x += b.vx * dt; b.y += b.vy * dt; b.travelled += b.speed || Math.hypot(b.vx, b.vy) * dt;
+      if (b.travelled > b.range || this.obstacles.some(o => Utils.pointInRect(b.x, b.y, o))) { b.dead = true; continue; }
+      for (const z of this.zombies) {
+        if (!z.dead && Math.hypot(z.x - b.x, z.y - b.y) < z.radius) { z.takeDamage(b.damage); b.dead = true; break; }
+      }
+    }
+    this.bullets = this.bullets.filter(b => !b.dead);
+    this.zombies = this.zombies.filter(z => !z.dead); // handles several zombies dying in the same frame
+
+    if (p.dead) this.state = 'gameover';
+  }
+
+  draw() {
+    const ctx = this.ctx, W = this.canvas.width, H = this.canvas.height;
+    ctx.fillStyle = '#1a1d19'; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.translate(-this.cam.x, -this.cam.y);
+    // Cracked-asphalt grid
+    ctx.strokeStyle = '#242823'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let x = 0; x <= WORLD.w; x += 100) { ctx.moveTo(x, 0); ctx.lineTo(x, WORLD.h); }
+    for (let y = 0; y <= WORLD.h; y += 100) { ctx.moveTo(0, y); ctx.lineTo(WORLD.w, y); }
+    ctx.stroke();
+    ctx.strokeStyle = '#6b2a24'; ctx.lineWidth = 6; ctx.strokeRect(0, 0, WORLD.w, WORLD.h); // world edge
+
+    const colors = { sandbag: '#8c7a55', crate: '#6e4b2a', car: '#4a5560', building: '#33302d' };
+    for (const o of this.obstacles) {
+      ctx.fillStyle = colors[o.type]; ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.strokeStyle = '#0006'; ctx.lineWidth = 3; ctx.strokeRect(o.x, o.y, o.w, o.h);
+    }
+    this.zombies.forEach(z => z.draw(ctx));
+    this.player.draw(ctx);
+    ctx.fillStyle = '#ffd35a';
+    for (const b of this.bullets) ctx.fillRect(b.x - 3, b.y - 3, 6, 6);
+    ctx.restore();
+
+    // Dark vignette for atmosphere
+    const g = ctx.createRadialGradient(W / 2, H / 2, H * .3, W / 2, H / 2, Math.max(W, H) * .7);
+    g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.65)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    UIManager.drawHUD(ctx, this);
+    if (this.state === 'gameover') UIManager.drawGameOver(ctx, W, H);
+  }
+}
+window.addEventListener('load', () => new GameManager(document.getElementById('game')));
+
+</script>
+</body>
+</html>
